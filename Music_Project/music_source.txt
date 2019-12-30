@@ -1,0 +1,486 @@
+library(rvest)
+library(stringr)
+library(KoNLP)
+library(dplyr)
+library(wordcloud)
+library(wordcloud2)
+library(doBy)
+library(ggplot2)
+library(RColorBrewer)
+library(tm)
+
+domain_url <- 'https://www.genie.co.kr'
+genie_top_200_url <- 'https://www.genie.co.kr/chart/top200?ditc=D&ymd=20190823&hh=17&rtm=Y&pg=' 
+songInfo_url <- 'https://www.genie.co.kr/detail/songInfo?xgnm='
+
+# genie top 200 song_ids
+# ================================================================
+song_ids <- c()
+start_genie_top_200_page <- 1
+end_genie_top_200_page <- 4
+for(i in start_genie_top_200_page:end_genie_top_200_page) {
+  genie_top_200_html <- read_html(paste0(genie_top_200_url,i))
+  music_chart_list <- html_node(genie_top_200_html, '.list-wrap')
+  song_ids <- c(song_ids , music_chart_list%>%
+                  html_node('tbody')%>%
+                  html_nodes('tr')%>%
+                  html_attr('songid'))
+}
+
+# top 200, [title, artist, album_name, genre, play_time, lyric_writer, song_writer, lyrics]
+# ================================================================
+index_artist <- 1 
+index_album_name <- 2
+index_genre <- 3
+index_play_time <- 4
+index_lyric_writer <- 5
+index_song_writer <- 6
+
+song_names <- c()
+artists <- c()
+album_names <- c()
+genre_names <- c()
+play_times <- c()
+lyric_writers <- c()
+song_writers <- c()
+lyrics <- c()
+
+start_song_id_index <- 1
+end_song_id_index <- 200
+for(song_id in song_ids[start_song_id_index:end_song_id_index]) {
+  song_info_html <- read_html(paste0(songInfo_url, song_id))
+  song_main_info <- html_node(song_info_html, '.info-zone')
+  song_sub_info <- song_main_info%>%
+    html_node('.info-data')%>%
+    html_nodes('li')%>%
+    html_nodes('span')
+  
+  sub_infos <- song_sub_info%>%
+    html_text()
+  sub_infos <- sub_infos[sub_infos != ""]
+  
+  song_names <- c(song_names, str_trim(song_main_info%>%
+                                         html_node('.name')%>%
+                                         html_text()))
+  artists <- c(artists, sub_infos[index_artist])
+  album_names <- c(album_names, sub_infos[index_album_name])
+  genre_names <- c(genre_names, sub_infos[index_genre])
+  play_times <- c(play_times, sub_infos[index_play_time])
+  lyric_writers <- c(lyric_writers, sub_infos[index_lyric_writer])
+  song_writers <- c(song_writers, sub_infos[index_song_writer])
+  
+  lyrics <- c(lyrics, html_node(song_info_html, '.tit-box')%>%
+                html_node('#pLyrics')%>%
+                html_node('p')%>%
+                html_text())
+}
+
+song_info_df <- data.frame(
+  artist = artists,
+  album_name = album_names,
+  genre_name = genre_names,
+  play_time = play_times,
+  lyric_writer = lyric_writers,
+  song_writer = song_writers,
+  lyric = lyrics,
+  stringsAsFactors = F
+)
+
+# rank에 따른 구간의 위치를 반환하는 함수
+get_interval_location <- function(rank, start, end, interval_count) {
+  if (rank == start) {
+    # cut함수의 right가 T로 표시되어 있으므로 구간의 오른쪽에 등호가 붙는다.
+    # 따라서 첫번째 rank의 예외처리를 해주어야 함
+    return(1)
+  } else {
+    return(as.numeric(cut(rank,
+                          breaks = seq(start, end, by = (end-start) / interval_count),
+                          right = T,
+                          labels = 1:interval_count)))
+    
+  }
+}
+
+
+get_weights_for_interval_count <- function(interval_count) {
+  # 구간의 개수에 따른 가중치 정보를 반환하는 함수
+  # interval_count 만큼 반환해야 함  
+  return(interval_count:1)
+}
+
+
+get_weight <- function(rank, start, end, interval_count, weights) {
+  # rank에 따른 가중치를 반환하는 함수
+  weight <- weights[get_interval_location(rank, start, end, interval_count)]
+  
+  return(weight)
+}
+
+apply_weight_song <- function(top_200_song_info_df, algo) {
+  weights <- c()
+  if (algo == 1) {
+    # 순위의 역순으로 번호를 매김
+    # 1위 <-> 200점
+    # 2위 <-> 199점
+    # ...
+    for(weight in nrow(top_200_song_info_df): 1) {
+      weights <- c(weights, weight)
+    }
+  }
+  else if (algo == 2) {
+    # 전체 데이터를 10등분하여 번호를 매김
+    # 1~25 1점
+    # 26~50 2점
+    # 51~75 3점
+    # ...
+    interval_count <- 10 # 구간의 개수, 즉 등분할 개수
+    start_index <- 1
+    last_index <- nrow(top_200_song_info_df)
+    total_data_count <- nrow(top_200_song_info_df)
+    interval <- total_data_count / interval_count #구간의 거리(전체 데이터에 의존한다)
+    weights_numbers <- get_weights_for_interval_count(interval_count) # 가중치 raw 데이터
+    
+    for(rank in start_index:last_index) {
+      weights <- c(weights, get_weight(rank, start_index, last_index, interval_count, get_weights_for_interval_count(interval_count)))
+    }
+  }
+  
+  weighted_df <- NA
+  if (length(weights) == nrow(top_200_song_info_df)) {
+    weighted_df <- cbind(top_200_song_info_df, weights)
+    colnames(weighted_df)[length(weighted_df)] <- 'weight'
+  }
+  
+  return(weighted_df)
+}
+
+song_data_with_weight <- apply_weight_song(song_info_df, algo = 2)
+
+# 가사 분석
+# ================================================================
+useSejongDic()
+first_song_index <- 1
+last_song_index <- nrow(song_data_with_weight)
+lyric_weight <- data.frame()
+for(i in first_song_index:last_song_index) {
+  weight <- song_data_with_weight[i, 'weight']
+  lyric <- song_data_with_weight[i, 'lyric']
+  genre <- song_data_with_weight[i, 'genre_name']
+  writer <- song_data_with_weight[i, 'lyric_writer']
+  
+  pharse_lyric <- SimplePos22(song_data_with_weight[i, 'lyric'])
+  pharse_lyric <- unlist(pharse_lyric)
+  pharse_lyric <- unique(pharse_lyric) #고유하게 추출
+  
+  each_lyric_weight <- data.frame(
+    characters = pharse_lyric,
+    weight = weight,
+    genre = genre,
+    writer = writer,
+    stringsAsFactors = F
+  )
+  
+  lyric_weight <- rbind(lyric_weight, each_lyric_weight)
+}
+
+# +를 기준으로 데이터를 split하고 split한 데이터에 대해 가중치를 부여
+split_lyric <- str_split(lyric_weight$characters, '\\+')
+split_weights <- c()
+split_genres <- c()
+split_writers <- c()
+for(i in 1:length(split_lyric)) {
+  for(j in 1:length(split_lyric[[i]])) {
+    split_weights <- c(split_weights, lyric_weight$weight[[i]])
+    split_genres <- c(split_genres, lyric_weight$genre[[i]])
+    split_writers <- c(split_writers, lyric_weight$writer[[i]])
+  }
+}
+
+split_weights_df <- data.frame(
+  character = unlist(split_lyric),
+  weight = split_weights,
+  genre = split_genres,
+  writer = split_writers,
+  stringsAsFactors = F
+)
+
+# 각 품사에 대한 조사
+# ================================================================
+
+noun_kind <- 'noun' # 명사
+ending_kind <- 'ending' # 어미
+complete_ending_kind <- 'complete_ending' # 종결어미
+preceding_ending_kind <- 'preceding_ending' # 종결어미
+adjective_kind <- 'adjective' # 형용사
+exclamation_kind <- 'exclamation' # 감탄사
+foreign_kind <- 'foreign' # 외국어
+verb_kind <- 'verb' # 동사 
+
+find_regex <- function(kind) {
+  #명사 - NC, NQ, NB, NP, NN
+  #어미 - EP, EC, ET, EE
+  #형용사 - PA
+  #감탄사 - II
+  #외국어 - f
+  #동사 - PV
+  return(switch(
+    kind,
+    'noun' = '.+?/(NC|NQ|NB|NN)',
+    'preceding_ending' = '.+?/(EP)',
+    'complete_ending' = '.+?/(EF)',
+    'ending' = '.+?/(EP|EF)', #전성어미, 연결어미는 의미가 없을것 같으므로 제외 EC,ET
+    'adjective' = '.+?/(PA)',
+    'exclamation' = '.+?/(II)',
+    'foreign' = '.+?/(f)',
+    'verb' = '.+?/(PV)'
+  ))
+}
+
+remove_term_regex <- function(kind) {
+  file_directory_path <- 'c:/Users/wdp/Desktop/Music_Project/'
+  file_name <- switch(kind,
+                      'noun' = 'not_명사.txt',
+                      'ending' = 'not_어미.txt',
+                      'complete_ending' = 'not_종결어미.txt',
+                      'adjective' = 'not_형용사.txt',
+                      'verb' = 'not_동사.txt')
+  
+  file_path <- paste0(file_directory_path, file_name)
+  remove_datas <- readLines(file_path)
+  regx <- paste0('[^', '(', match_regex(remove_datas), ')', ']')
+  return(regx)
+}
+
+match_regex <- function(vector) {
+  regx <- paste0('^', '(', paste(vector, collapse = '|'), ')', '$')
+  return(regx)
+}
+
+# full Term
+full_term <- lyric_weight%>%
+  select(characters, weight)
+# full_term$characters <- str_replace_all(full_term$characters, '/[[A-Z]|\\+]+', '')
+
+# # unique full term
+# unique_full_term <- unique(full_term$characters)
+
+# 명사만 뽑은 경우
+noun_only <- split_weights_df%>%
+  filter(str_detect(character, find_regex(noun_kind)))
+noun_only$character <- str_replace(noun_only$character, '/.+', '')
+
+# 어미만 뽑은 경우
+ending_only <- split_weights_df%>%
+  filter(str_detect(character, find_regex(ending_kind)))
+ending_only$character <- str_replace(ending_only$character, '/.+', '')
+  # 전성어미만 뽑은 경우
+  preceding_ending_only <- split_weights_df%>%
+    filter(str_detect(character, find_regex(preceding_ending_kind)))
+  preceding_ending_only$character <- str_replace(preceding_ending_only$character, '/.+', '')
+  # 종결어미만 뽑은 경우
+  complete_ending_only <- split_weights_df%>%
+    filter(str_detect(character, find_regex(ending_kind)))
+  complete_ending_only$character <- str_replace(complete_ending_only$character, '/.+', '')
+
+# 형용사만 뽑은 경우 
+adjective_only <- split_weights_df%>%
+  filter(str_detect(character, find_regex(adjective_kind)))
+adjective_only$character <- str_replace(adjective_only$character, '/.+', '')
+
+# 동사만 뽑은 경우 
+verb_only <- split_weights_df%>%
+  filter(str_detect(character, find_regex(verb_kind)))
+verb_only$character <- str_replace(verb_only$character, '/.+', '')
+
+# 정제
+# ================================================================
+
+# 명사/
+# 가사 불용어 제거 및 같은 단어 가중치 합치기 
+weight_noun <- noun_only%>%
+  filter(str_detect(character, remove_term_regex(noun_kind)))%>%
+  group_by(str_sub(character, start=1, end=2))%>%
+  summarise(sum_weight = sum(weight))
+
+# 어미/
+weight_ending <- ending_only%>%
+  filter(str_detect(character, remove_term_regex(ending_kind)))%>%
+  group_by(character)%>%
+  summarise(sum_weight = sum(weight))
+  # 전성어미/
+  preceding_weight_ending <- preceding_ending_only%>%
+    filter(str_detect(character, remove_term_regex(ending_kind)))%>%
+    group_by(character)%>%
+    summarise(sum_weight = sum(weight))
+  # 종결어미/
+  complete_weight_ending <- complete_ending_only%>%
+    filter(str_detect(character, remove_term_regex(complete_ending_kind)))%>%
+    group_by(character)%>%
+    summarise(sum_weight = sum(weight))
+
+# 형용사/
+weight_adjective <- adjective_only%>%
+  filter(str_detect(character, remove_term_regex(adjective_kind)))%>%
+  group_by(character)%>%
+  summarise(sum_weight = sum(weight))
+
+# 동사/
+weight_verb <- verb_only%>%
+  filter(str_detect(character, remove_term_regex(verb_kind)))%>%
+  group_by(character)%>%
+  summarise(sum_weight = sum(weight))
+
+# 분석
+# ================================================================
+
+my_wordcloud <- function(df) {
+  wordcloud2(
+    data = df,
+    color = apply_order_colors(rownames(df),
+                               until_1=3,
+                               until_2=7,
+                               until_3=10),
+    shuffle = F,
+    minRotation = 0,
+    maxRotation =0
+  )
+}
+
+# 명사 분석
+top50_noun <- head(orderBy(~-sum_weight, weight_noun), 50)
+colnames(top50_noun) <- c('character','sum_weight')
+
+apply_order_colors <- function(orders, until_1, until_2, until_3) {
+  colors <- c()
+  for(i in 1:length(orders)) {
+    if(i <= until_1) {
+      colors <- c(colors, 'red')
+    } else if(i <= until_2) {
+      colors <- c(colors, 'green')
+    } else if(i <= until_3) {
+      colors <- c(colors, 'blue')
+    } else {
+      colors <- c(colors, 'black')
+    }
+  }
+  return(colors)
+}
+
+# 어미 분석
+# 현재, 과거, 미래에 대한 어미조사: 선어말 어미 
+# 동사의 활용에 대한 조사: 종결어미
+top_10_ending <- data.frame(head(orderBy(~-sum_weight, weight_ending), 10))$character
+top_10_preceding_ending <- data.frame(head(orderBy(~-sum_weight, preceding_weight_ending), 10))$character
+top_10_complete_ending <- data.frame(head(orderBy(~-sum_weight, complete_weight_ending), 10))$character
+
+my_wordcloud(head(orderBy(~-sum_weight, weight_ending), 50))
+my_wordcloud(head(orderBy(~-sum_weight, preceding_weight_ending), 50))
+my_wordcloud(head(orderBy(~-sum_weight, complete_weight_ending), 50))
+
+# 형용사 분석
+top_20_adjective <- data.frame(head(orderBy(~-sum_weight, weight_adjective), 20))
+my_wordcloud(head(orderBy(~-sum_weight, weight_adjective), 50))
+
+# 동사 분석
+top_20_verbs <- data.frame(head(orderBy(~-sum_weight, weight_verb), 20))$character
+my_wordcloud(head(orderBy(~-sum_weight, weight_verb), 50))
+
+# full term을 기준으로 top 10의 동사와 top 10의 어미를 놓았을때 어떻게 연결될것인가
+anal_verb_ending <- function(verbs, endings) {
+  anal_verb_ending_df <- NULL
+  for(iter_verb in verbs) {
+    target_dataset <- grep(paste0('^',iter_verb), 
+                           full_term$characters, 
+                           value = T)
+    target_dataset <- str_replace(target_dataset, paste0('', iter_verb), '')
+    verb_ending_df <- NULL
+    counts <- c()
+    for(iter_ending in endings) {
+      counts <- c(counts, 1)
+      verb_ending_df <- data.frame(
+        verb = iter_verb,
+        ending = iter_ending,
+        count = sum(str_detect(target_dataset, iter_ending)),
+        stringsAsFactors = F)
+      
+      anal_verb_ending_df <- rbind(anal_verb_ending_df, verb_ending_df)
+    }
+  }
+  return(anal_verb_ending_df)
+}
+
+# For Test
+grep(paste0('좋/PA'), 
+     full_term$characters, 
+     value = T)
+
+grep(paste0('아/EF'), 
+     full_term$characters, 
+     value = T)
+
+View(song_data_with_weight$lyric)
+
+grep('될까',song_data_with_weight$lyric, value = T)
+
+count_per_colors <- function(counts) {
+  # point의 색상을 지정하는 작업
+  # 구간을 5개로 나누는데, 
+  # 거리를 기준으로 나눈다.
+  # 그리고 색상 적용
+  min_count <- min(counts)
+  count_distance <- max(counts) - min(counts)
+  increment_count <- count_distance / 5
+  color <- sapply(counts,
+                  function(x) {
+                    if (x >= 0 & x < min_count + increment_count) {
+                      'white'
+                    } else if (x < min_count + 2*increment_count) {
+                      'yellow'
+                    } else if (x < min_count + 3*increment_count) {
+                      'green'
+                    } else if (x < min_count + 4*increment_count) {
+                      'blue'
+                    } else {
+                      'red'
+                    }
+                  })
+}
+
+# 동사와 어미간의 관계 조사
+# ================================================================
+anal_verb_ending_df <- anal_verb_ending(top_20_verbs, top_10_ending)
+ggplot(data=anal_verb_ending_df,
+       aes(x=factor(verb, top_20_verbs),
+           y=factor(ending, top_10_ending)),
+       backgroundColor = 'Red')+
+  ggtitle('동사와 어미간 연관 빈도수 조사')+
+  labs(x='동사', y='어미')+
+  geom_point(aes(size=count),
+             color = count_per_colors(anal_verb_ending_df$count))+
+  theme(panel.background = element_rect(fill = 'gray'))
+
+# 동사와 선어말어미간의 관계 조사
+anal_verb_preceding_ending_df <- anal_verb_ending(top_20_verbs, paste0(top_10_preceding_ending, '/EP'))
+anal_verb_preceding_ending_df$ending <- str_replace(anal_verb_preceding_ending_df$ending, '/.+', '')
+ggplot(data=anal_verb_preceding_ending_df,
+       aes(x=factor(verb, top_20_verbs),
+           y=factor(ending, top_10_preceding_ending)),
+       backgroundColor = 'Red')+
+  ggtitle('동사와 선어말어미간 연관 빈도수 조사')+
+  labs(x='동사', y='선어말어미')+
+  geom_point(aes(size=count),
+             color = count_per_colors(anal_verb_preceding_ending_df$count))+
+  theme(panel.background = element_rect(fill = 'gray'))
+
+# 동사와 종결어미간의 관계 조사
+anal_verb_complete_ending_df <- anal_verb_ending(top_20_verbs, paste0(top_10_complete_ending, '/EF'))
+anal_verb_complete_ending_df$ending <- str_replace(anal_verb_complete_ending_df$ending, '/.+', '')
+ggplot(data=anal_verb_complete_ending_df,
+       aes(x=factor(verb, top_20_verbs),
+           y=factor(ending, top_10_complete_ending)),
+       backgroundColor = 'Red')+
+  ggtitle('동사와 종결어미간 연관 빈도수 조사')+
+  labs(x='동사', y='종결어미')+
+  geom_point(aes(size=count),
+             color = count_per_colors(anal_verb_complete_ending_df$count))+
+  theme(panel.background = element_rect(fill = 'gray'))
